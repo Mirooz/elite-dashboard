@@ -26,8 +26,8 @@ import java.util.Set;
  *
  * <p>Deux techniques cohabitent :</p>
  * <ul>
- *   <li><b>Field-by-field</b> : {@code DockingGranted}, {@code DockingDenied}, {@code FSSSignalDiscovered}
- *       (reshaping trop spécifique pour {@code treeToValue}).</li>
+ *   <li><b>Field-by-field</b> : {@code DockingGranted}, {@code DockingDenied},
+ *       {@code FSSSignalDiscovered} (batch {@code signals[]}, trop spécifique pour {@code treeToValue}).</li>
  *   <li><b>Enrich + {@link ObjectMapper#treeToValue treeToValue}</b> : {@link ObjectNode} enrichi converti
  *       en POJO. Schémas stricts : champs inconnus ignorés ({@code FAIL_ON_UNKNOWN_PROPERTIES=false}).
  *       {@code journal/1} : le POJO généré inclut une carte {@code additionalProperties} (jsonschema2pojo
@@ -114,29 +114,66 @@ final class EddnEventMappers {
     }
 
     /**
-     * {@code fsssignaldiscovered/1} : le journal émet <i>un</i> signal à plat ; EDDN attend un
-     * tableau {@code signals[]} avec les champs signal ({@code SignalName}, {@code SignalType}, …)
-     * nichés dans chaque élément. Renvoie {@code null} si l'event doit être droppé (signal invalide
-     * ou {@code USSType == $USS_Type_MissionTarget;}).
+     * {@code fsssignaldiscovered/1} : le journal émet un signal à plat par event ; EDDN exige de
+     * coalescer un run contigu en un seul message {@code signals[]}, avec {@code StarSystem} /
+     * {@code StarPos} issus du contexte (Location / FSDJump / CarrierJump) et un cross-check
+     * obligatoire du {@code SystemAddress}. Renvoie {@code null} si rien à publier (contexte
+     * incomplet, aucun signal valide, ou tous droppés).
+     *
+     * <p>Les {@code raws} fournis sont déjà filtrés côté publisher pour matcher
+     * {@link CommanderStatus#getCurrentSystemAddress()}.</p>
      */
-    EddnMessages.FSSSignalDiscovered mapFssSignalDiscovered(JsonNode raw) {
-        if (!raw.has("SignalName")) {
+    EddnMessages.FSSSignalDiscovered mapFssSignalDiscoveredBatch(List<JsonNode> raws) {
+        if (raws == null || raws.isEmpty()) {
             return null;
         }
-        if (USS_TYPE_MISSION_TARGET.equals(raw.path("USSType").asText(""))) {
+        Long ctxAddr = commanderStatus.getCurrentSystemAddress();
+        String starSystem = commanderStatus.getCurrentStarSystem();
+        double[] starPos = commanderStatus.getCurrentStarPos();
+        if (ctxAddr == null
+                || starSystem == null || starSystem.isBlank()
+                || starPos == null || starPos.length != 3) {
             return null;
         }
+
+        List<EddnSignal__1> signals = new ArrayList<>(raws.size());
+        String firstTimestamp = null;
+        for (JsonNode raw : raws) {
+            if (raw == null || !raw.has("SignalName")) {
+                continue;
+            }
+            if (USS_TYPE_MISSION_TARGET.equals(raw.path("USSType").asText(""))) {
+                continue;
+            }
+            // Défense en profondeur : ne jamais augmenter avec un mauvais système.
+            if (!raw.has("SystemAddress")
+                    || !raw.get("SystemAddress").canConvertToLong()
+                    || raw.get("SystemAddress").asLong() != ctxAddr.longValue()) {
+                continue;
+            }
+            if (firstTimestamp == null) {
+                firstTimestamp = raw.path("timestamp").asText();
+            }
+            signals.add(mapFssSignalItem(raw));
+        }
+        if (signals.isEmpty() || firstTimestamp == null) {
+            return null;
+        }
+
         EddnMessages.FSSSignalDiscovered msg = new EddnMessages.FSSSignalDiscovered();
-        msg.setTimestamp(raw.path("timestamp").asText());
+        msg.setTimestamp(firstTimestamp);
         msg.setEvent(EddnMessage__10.Event.FSS_SIGNAL_DISCOVERED);
-        if (raw.has("SystemAddress")) {
-            msg.setSystemAddress(raw.get("SystemAddress").asLong());
-        }
-        fillStarSystemSetter(msg::setStarSystem, raw);
-        fillStarPosSetter(msg::setStarPos, raw);
+        msg.setSystemAddress(ctxAddr);
+        msg.setStarSystem(starSystem);
+        msg.setStarPos(List.of(starPos[0], starPos[1], starPos[2]));
         msg.setHorizons(commanderStatus.getHorizons());
         msg.setOdyssey(commanderStatus.getOdyssey());
+        msg.setSignals(signals);
+        return msg;
+    }
 
+    /** Un élément de {@code signals[]} (sans {@code SystemAddress} / {@code event} — spec EDDN). */
+    private static EddnSignal__1 mapFssSignalItem(JsonNode raw) {
         EddnSignal__1 signal = new EddnSignal__1();
         signal.setTimestamp(raw.path("timestamp").asText());
         signal.setSignalName(raw.path("SignalName").asText());
@@ -165,11 +202,7 @@ final class EddnEventMappers {
             signal.setThreatLevel(raw.get("ThreatLevel").asLong());
         }
         // TimeRemaining volontairement omis (spec EDDN : éphémère, donnée PII).
-
-        List<EddnSignal__1> signals = new ArrayList<>(1);
-        signals.add(signal);
-        msg.setSignals(signals);
-        return msg;
+        return signal;
     }
 
     // ==================================================================
@@ -444,38 +477,6 @@ final class EddnEventMappers {
                 arr.add(pos[2]);
                 msg.set("StarPos", arr);
             }
-        }
-    }
-
-    /**
-     * Résout le {@code StarSystem} (raw event → commandant) pour les mappers field-by-field.
-     * Abstrait le setter afin que l'appelant n'ait pas à dupliquer la logique de fallback.
-     */
-    private void fillStarSystemSetter(java.util.function.Consumer<String> setter, JsonNode raw) {
-        String fromRaw = raw.path("StarSystem").asText("");
-        if (!fromRaw.isBlank()) {
-            setter.accept(fromRaw);
-            return;
-        }
-        String fromCtx = commanderStatus.getCurrentStarSystem();
-        if (fromCtx != null && !fromCtx.isBlank()) {
-            setter.accept(fromCtx);
-        }
-    }
-
-    /**
-     * Résout {@code StarPos} (raw event → commandant) pour les mappers field-by-field.
-     * Le setter attend une {@code List<Double>} (format du POJO).
-     */
-    private void fillStarPosSetter(java.util.function.Consumer<List<Double>> setter, JsonNode raw) {
-        JsonNode pos = raw.path("StarPos");
-        if (pos.isArray() && pos.size() == 3) {
-            setter.accept(List.of(pos.get(0).asDouble(), pos.get(1).asDouble(), pos.get(2).asDouble()));
-            return;
-        }
-        double[] ctx = commanderStatus.getCurrentStarPos();
-        if (ctx != null && ctx.length == 3) {
-            setter.accept(List.of(ctx[0], ctx[1], ctx[2]));
         }
     }
 

@@ -5,6 +5,10 @@ import be.mirooz.elitedangerous.dashboard.service.PreferencesService;
 import be.mirooz.elitedangerous.eddn.EddnSchemas;
 import com.fasterxml.jackson.databind.JsonNode;
 
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+
 /**
  * Routeur EDDN : invoqué par chaque {@code JournalEventHandler} via le décorateur
  * {@link be.mirooz.elitedangerous.dashboard.handlers.events.EddnPublishingEventHandlerDecorator},
@@ -18,9 +22,15 @@ import com.fasterxml.jackson.databind.JsonNode;
  *   JsonNode raw  →  mapper.mapXxx(raw)  →  EddnMessages.* POJO  →  uploader.publishMessage(...)
  * </pre>
  *
- * <p>Le routeur conserve une seule responsabilité annexe : tracker le contexte commandant
- * ({@code SystemAddress}, {@code StarPos}) sur les events navigationnels, pour que les mappers
- * puissent enrichir les events qui ne les contiennent pas nativement.</p>
+ * <p>Le routeur conserve deux responsabilités annexes :</p>
+ * <ul>
+ *   <li>tracker le contexte commandant ({@code SystemAddress}, {@code StarSystem}, {@code StarPos})
+ *       sur les events navigationnels, pour que les mappers puissent enrichir les events qui ne
+ *       les contiennent pas nativement ;</li>
+ *   <li>bufferiser les {@code FSSSignalDiscovered} (spec EDDN : coalescer en un seul message
+ *       {@code signals[]}, n'envoyer qu'après cross-check du {@code SystemAddress} avec le
+ *       contexte — les signaux Odyssey arrivent souvent <i>avant</i> le {@code FSDJump}).</li>
+ * </ul>
  */
 public final class EddnJournalPublisher {
 
@@ -30,6 +40,12 @@ public final class EddnJournalPublisher {
     private final CommanderStatus commanderStatus = CommanderStatus.getInstance();
     private final PreferencesService preferencesService = PreferencesService.getInstance();
     private final EddnEventMappers mappers = new EddnEventMappers(commanderStatus);
+
+    /**
+     * Buffer des {@code FSSSignalDiscovered} en attente de flush (run contigu + éventuellement
+     * signaux Odyssey dont le jump n'a pas encore mis à jour le contexte).
+     */
+    private final List<JsonNode> pendingFssSignals = new ArrayList<>();
 
     private EddnJournalPublisher() {
     }
@@ -57,7 +73,16 @@ public final class EddnJournalPublisher {
         trackCommanderContext(event, jsonNode);
 
         try {
+            if ("FSSSignalDiscovered".equals(event)) {
+                pendingFssSignals.add(jsonNode);
+                return;
+            }
+            // Tout autre event termine le run contigu : flush des signaux dont le SystemAddress
+            // matche le contexte. Après un event navigationnel, les mismatches sont abandonnés
+            // (nouvelle position confirmée). Sinon on les garde (attente du FSDJump Odyssey).
+            flushPendingFssSignals(isNavigational(event));
             route(event, jsonNode);
+
         } catch (Exception e) {
             System.err.println("EDDN route " + event + " : " + e.getMessage());
         }
@@ -93,9 +118,6 @@ public final class EddnJournalPublisher {
             case "FSSDiscoveryScan":
                 send(EddnSchemas.FSS_DISCOVERY_SCAN_V1, mappers.mapFssDiscoveryScan(raw));
                 break;
-            case "FSSSignalDiscovered":
-                send(EddnSchemas.FSS_SIGNAL_DISCOVERED_V1, mappers.mapFssSignalDiscovered(raw));
-                break;
             case "NavBeaconScan":
                 send(EddnSchemas.NAV_BEACON_SCAN_V1, mappers.mapNavBeaconScan(raw));
                 break;
@@ -122,6 +144,42 @@ public final class EddnJournalPublisher {
         }
     }
 
+    /**
+     * Publie le batch FSS en attente dont le {@code SystemAddress} matche le contexte commandant.
+     *
+     * @param dropMismatches si {@code true} (après Location / FSDJump / CarrierJump), abandonne
+     *                       les signaux dont l'adresse ne correspond pas ; sinon les conserve
+     *                       pour un flush ultérieur une fois le jump reçu.
+     */
+    private void flushPendingFssSignals(boolean dropMismatches) {
+        if (pendingFssSignals.isEmpty()) {
+            return;
+        }
+        Long ctxAddr = commanderStatus.getCurrentSystemAddress();
+        List<JsonNode> matching = new ArrayList<>();
+        Iterator<JsonNode> it = pendingFssSignals.iterator();
+        while (it.hasNext()) {
+            JsonNode raw = it.next();
+            if (ctxAddr != null
+                    && raw.has("SystemAddress")
+                    && raw.get("SystemAddress").canConvertToLong()
+                    && raw.get("SystemAddress").asLong() == ctxAddr.longValue()) {
+                matching.add(raw);
+                it.remove();
+            } else if (dropMismatches) {
+                it.remove();
+            }
+        }
+        if (matching.isEmpty()) {
+            return;
+        }
+        try {
+            send(EddnSchemas.FSS_SIGNAL_DISCOVERED_V1, mappers.mapFssSignalDiscoveredBatch(matching));
+        } catch (Exception e) {
+            System.err.println("EDDN FSSSignalDiscovered batch : " + e.getMessage());
+        }
+    }
+
     /** Délègue à l'uploader en filtrant les POJOs null (mapper a décidé qu'il n'y avait rien à publier). */
     private void send(String schemaRef, Object pojo) {
         if (pojo == null) {
@@ -135,15 +193,22 @@ public final class EddnJournalPublisher {
     //  enrichir les events qui ne contiennent pas nativement StarPos / SystemAddress.
     // ------------------------------------------------------------------
 
-    private void trackCommanderContext(String event, JsonNode raw) {
-        boolean navigational = "FSDJump".equals(event)
+    private static boolean isNavigational(String event) {
+        return "FSDJump".equals(event)
                 || "Location".equals(event)
                 || "CarrierJump".equals(event);
-        if (!navigational) {
+    }
+
+    private void trackCommanderContext(String event, JsonNode raw) {
+        if (!isNavigational(event)) {
             return;
         }
         if (raw.has("SystemAddress") && raw.get("SystemAddress").canConvertToLong()) {
             commanderStatus.setCurrentSystemAddress(raw.get("SystemAddress").asLong());
+        }
+        String starSystem = raw.path("StarSystem").asText("");
+        if (!starSystem.isBlank()) {
+            commanderStatus.setCurrentStarSystem(starSystem);
         }
         JsonNode pos = raw.get("StarPos");
         if (pos != null && pos.isArray() && pos.size() == 3) {
